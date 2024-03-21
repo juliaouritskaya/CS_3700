@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+import random
+import socket
+import json
+import sys
+import ssl
+import os
+
+# Global variables
+PORT = 27993 # Default port for server connection
+USE_TLS = False # Flag to indicate if TLS should be used
+HOSTNAME = None # Hostname or IP address of the server
+USERNAME = None # Northeastern username for authentication
+
+def send_hello(s):
+    """
+    Sends a 'hello' message to the server to initiate the game.
+
+    :param s: socket object
+        The socket connection to the server.
+    :return: string
+        The game ID sent back from the server.
+    """
+    try:
+        global USERNAME
+        # Prepare the 'hello' message with the username
+        hello_message = {
+            'type': 'hello',
+            'northeastern_username': USERNAME
+        }
+        # Convert dictionary to JSON string and send to server
+        hello_message = convert_dict_json(hello_message)
+        response = send_json_server(hello_message, s)
+
+        # Convert server response from JSON string to dictionary
+        hello_response = convert_json_dict(response)
+        # Return the game ID from the server response
+        return hello_response['id']
+    except json.JSONDecodeError as e:
+        print(f"JSON decoding error in send_hello: {e}")
+        return None
+    except Exception as e:
+        print(f"Error in send_hello: {e}")
+        return None
+
+def send_json_server(json_data, s):
+    """
+    Sends JSON data to the server and receives the response.
+
+    :param json_data: string
+        JSON string to send to the server.
+    :param s: socket object
+        The socket connection to the server.
+    :return: string
+        The server's response as a decoded string.
+    """
+    try:
+        # Send the JSON data to the server
+        s.sendall(json_data.encode())
+        # Receive the response from the server
+        data = s.recv(2048)
+        # Return the decoded response
+        return data.decode()
+    except socket.error as e:
+        print(f"Socket error in send_json_server: {e}")
+        return None
+
+def convert_json_dict(data):
+    """
+    Converts a JSON string into a dictionary.
+
+    :param data: string
+        The JSON string to convert.
+    :return: dictionary
+        The resulting dictionary.
+    """
+    # Convert JSON string to a Python dictionary
+    return json.loads(data)
+
+def send_guess(game_id, word, s):
+    """
+    Sends a guess to the server.
+
+    :param game_id: string
+        The game ID for the current game.
+    :param word: string
+        The word guess to send to the server.
+    :param s: socket object
+        The socket connection to the server.
+    :return: string
+        The server's response as a decoded string.
+    """
+    try:
+        # Prepare the 'guess' message with the game ID and the guessed word
+        guess = {
+            'type': 'guess',
+            'id': game_id,
+            'word': word
+        }
+        # Convert the dictionary to JSON string and send to server
+        guess_json = convert_dict_json(guess)
+        # Send the guess and return the server's response
+        return send_json_server(guess_json, s)
+    except Exception as e:
+        print(f"Error in send_guess: {e}")
+        return None
+
+def convert_dict_json(dict):
+    """
+    Converts a dictionary into a JSON string.
+
+    :param dict: dictionary
+        The dictionary to convert.
+    :return: string
+        The JSON string representation of the dictionary.
+    """
+    # Convert Python dictionary to JSON string
+    return json.dumps(dict) + '\n'
+
+
+def parse_command_line():
+    """
+    Parses the command line arguments to set global configuration variables.
+    It sets the port, TLS usage, server hostname, and user's Northeastern username.
+    """
+    global PORT, USE_TLS, HOSTNAME, USERNAME
+    # Check for port argument and update PORT
+    if '-p' in sys.argv:
+        p_index = sys.argv.index('-p')
+        PORT = int(sys.argv[p_index + 1])
+
+    # Check for TLS flag and update USE_TLS and PORT accordingly
+    if '-s' in sys.argv:
+        USE_TLS = True
+        if '-p' not in sys.argv:
+            PORT = 27994
+
+    # Set HOSTNAME and USERNAME from command line arguments
+    HOSTNAME = sys.argv[-2]
+    USERNAME = sys.argv[-1]
+
+def read_word_list(word_list_file):
+    """
+    Reads a list of allowed words from a file.
+
+    :param word_list_file: string
+        Path to the file containing the word list.
+    :return: list
+        A list of words.
+    """
+    try:
+        list_of_words = []
+
+        # Open the word list file and read each line
+        with open(word_list_file, 'r') as word_list:
+            for line in word_list:
+                # Strip each line to remove newline characters and add to list
+                list_of_words.append(line.strip())
+
+        return list_of_words
+    except IOError as e:
+        print(f"Error reading word list file: {e}")
+        return []
+
+def refine_word_list(word_list, guess, marks):
+    """
+    Refines the list of potential words based on the feedback from a guess.
+
+    :param word_list: list
+        A list of current potential words.
+    :param guess: string
+        The guessed word.
+    :param marks: list
+        Feedback marks for each letter in the guessed word.
+    :return: list
+        A refined list of potential words.
+    """
+    refined_list = []
+
+    for word in word_list:
+        match = True
+        # Check each letter in the guess against feedback
+        for i, char in enumerate(guess):
+            if marks[i] == 2:
+                if word[i] != char:
+                    # If the letter must be in this position but isn't
+                    match = False
+                    break
+            elif marks[i] == 1:
+                if char not in word or marks[i] == char:
+                    # If the letter must be in the word but in a different position
+                    match = False
+                    break
+
+        if match:
+            refined_list.append(word)
+
+    return refined_list
+
+def choose_next_guess(guess_history, word_list):
+    """
+    Chooses the next guess based on the history of previous guesses and their feedback.
+
+    :param guess_history: list of tuples
+        Each tuple contains a guessed word and its corresponding marks.
+    :param word_list: list of strings
+        The list of possible words to guess from/
+    :return: string
+        The next word to guess.
+    """
+    # If no guesses have been made yet, return a random word
+    if not guess_history:
+        return random.choice(word_list)
+
+    # Process each guess in the history to refine the word list
+    refined_word_list = word_list
+    for guess, marks in guess_history:
+        refined_word_list = refine_word_list(refined_word_list, guess, marks)
+
+    # Choose the next guess from the refined list
+    next_guess = random.choice(refined_word_list) if refined_word_list else None
+
+    return next_guess
+
+
+def handle_bye(response):
+    """
+    Handles a 'bye' message from the server, extracting and saving the secret flag.
+
+    :param response: string
+        The JSON response from the server containing the 'bye' message.
+    :return: string
+        The secret flag received from the server.
+    """
+    flags_already_found = []
+
+    # Check if the secret_flags file already exists and read existing flags
+    if os.path.isfile('secret_flags'):
+        with open('secret_flags', 'r') as flags_file:
+            for line in flags_file:
+                flags_already_found.append(line.strip())
+
+    try:
+        # Convert the JSON response to a dictionary
+        bye_data = convert_json_dict(response)
+
+        # Check if the response is a 'bye' message
+        if bye_data.get('type') != 'bye':
+            raise ValueError("Expected a bye message")
+
+        # Extract the secret flag
+        secret_flag = bye_data.get('flag', None)
+        print(secret_flag)
+        if secret_flag is None:
+            raise ValueError("Flag not found in bye message")
+
+        # Write the secret flag to the file if it's not already recorded
+        with open('secret_flags', 'a') as file:
+            if secret_flag not in flags_already_found:
+                file.write(secret_flag + '\n')
+
+        return secret_flag
+
+    except Exception as e:
+        print(f"Error handling bye message: {e}")
+        return None
+
+
+def main():
+    """
+    Main execution function for the client program.
+    Manages command-line parsing, socket connection, and game logic.
+    """
+    global HOSTNAME, PORT
+
+    # Parse command line arguments
+    parse_command_line()
+
+    # Load the word list
+    word_list = read_word_list('word_list.txt')
+
+    try:
+        # Establish socket connection
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # Wrap socket with TLS
+            if USE_TLS:
+                context = ssl.create_default_context()
+                s = context.wrap_socket(s, server_hostname=HOSTNAME)
+
+            s.connect((HOSTNAME, PORT))
+
+            # Send hello message and receive game ID
+            game_id = send_hello(s)
+
+            # Initialize guess history
+            guess_history = []
+
+            # Game loop
+            while True:
+                word_to_guess = choose_next_guess(guess_history, word_list)
+
+                # Send guess and receive response
+                response = send_guess(game_id, word_to_guess, s)
+
+                try:
+                    response_data = convert_json_dict(response)
+                except json.JSONDecodeError as e:
+                    print(f"JSON decoding error: {e}, response: {response}")
+                    break
+
+                # Handle the server's response
+                if response_data['type'] == 'bye':
+                    secret_flag = handle_bye(response)
+                    break
+                elif response_data['type'] == 'retry':
+                    # Update guess history and continue guessing
+                    # Extrack marks for the most recent guess
+                    latest_guess = response_data['guesses'][-1]  # Get the last guess
+                    marks = latest_guess['marks']
+                    if not marks:
+                        break
+                    guess_history.append((word_to_guess, marks))
+
+    except socket.error as e:
+        print(f"Socket error in main: {e}")
+    except Exception as e:
+        print(f"General error in main: {e}")
+    finally:
+        s.close()
+
+main()
