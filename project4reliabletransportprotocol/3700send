@@ -1,0 +1,179 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, sys, hashlib, base64
+
+DATA_SIZE = 1375
+WINDOW_SIZE = 4  # Sender-side window size
+ACK_TIMEOUT = 1.0  # Adjusted ACK timeout to 1 second to account for RTT
+
+
+def calculate_checksum(data):
+    """
+    Calculates an SHA-256 checksum for the given data, encoded in Base64.
+
+    :param data: The data for which to calculate the checksum.
+    :return: The Base64-encoded SHA-256 checksum of the data.
+    """
+    # Initialize a new SHA-256 hash object
+    sha256 = hashlib.sha256()
+    # Update the hash object with the data
+    sha256.update(data)
+    # Return the hash, encoded in Base64
+    return base64.b64encode(sha256.digest()).decode('utf-8')
+
+
+def verify_checksum(data, received_checksum):
+    """
+    Verifies that the given data matches the received SHA-256 checksum, decoded from Base64.
+
+    :param data: The received data to verify.
+    :param received_checksum: The Base65-encoded SHA-256 checksum against which to verify the data.
+    :return: True if the checksum of the data matches the received checksum, False otherwise.
+    """
+    # Calculate checksum for the given data
+    calculated_checksum = calculate_checksum(data)
+    # Compare the calculated checksum with the received one
+    return calculated_checksum == received_checksum
+
+
+class Sender:
+    def __init__(self, host, port):
+        """
+        Initialize the Sender instance.
+
+        :param host: The IP address of the remote host to which data will be sent.
+        :param port: The port number on the remote host to which data will be sent.
+        """
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.sequence_number = 0  # Initialize sequence number for packets
+        self.unacked_packets = {}  # Dictionary to track unacknowledged packets
+        self.start_window = 1  # Initialize end of the sender window
+        self.end_window = WINDOW_SIZE  # Initialize end of the sender window
+        self.window_size = 1
+        self.mode = "slow start"
+        self.thresh = 64
+
+    @staticmethod
+    def log(message):
+        """
+        Logs a message to a standard error.
+
+        :param message: The message to be logged.
+        """
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send_packet(self, message, seq):
+        """
+        Sends a packet to the remote host with added checksum for integrity verification.
+
+        :param message: The message data to be sent.
+        :param seq: The sequence number of the packet.
+        """
+        # Convert the message to JSON and encode it to bytes
+        packet = json.dumps(message).encode('utf-8')
+        # Calculate the checksum of the packet
+        checksum = calculate_checksum(packet)
+        # Include both the message and its checksum in the final packet
+        packet_with_checksum = json.dumps({'data': message, 'checksum': checksum}).encode('utf-8')
+        # Send the packet over the network
+        self.socket.sendto(packet_with_checksum, (self.host, self.remote_port))
+        # Record the packet and its send time to handle acknowledgements and potential resends
+        self.unacked_packets[seq] = (message, time.time())
+
+    def resend_packets(self):
+        """
+        Resends packets that have not been acknowledged within the expected timeout period.
+        """
+        current_time = time.time()
+        # Iterate through unacknowledged packets to check for timeout
+        for seq, (packet, send_time) in list(self.unacked_packets.items()):
+            # If the current time exceeds the send time plus the timeout threshold, resend the packet
+            if current_time - send_time > ACK_TIMEOUT:
+                self.log(f"Resending packet seq {seq} due to timeout")
+                self.send_packet(packet, seq)
+
+    def receive_ack(self):
+        """
+        Processes incoming ACKs, adjusting the congestion window and handling
+        new ACKs, duplicate ACKs, and triggering fast retransmission when necessary.
+        """
+        while True:
+            # Wait for incoming ACKs with a non-blocking select call
+            ready = select.select([self.socket], [], [], 0.1)
+            if ready[0]:
+                ack, _ = self.socket.recvfrom(1024)  # Receive an ACK packet
+                try:
+                    # Decode the received ACK from JSON
+                    ack_packet = json.loads(ack.decode('utf-8'))
+                    # Receive the ACK message and validate its checksum
+                    ack_data = json.dumps(ack_packet['data']).encode('utf-8')
+                    if verify_checksum(ack_data, ack_packet['checksum']):
+                        ack_msg = ack_packet['data']
+                        # Check if the ACK is for a packet that's currently unacknowledged
+                        if ack_msg["type"] == "ack" and ack_msg["seq"] in self.unacked_packets:
+                            # New ACK received, remove packet from unacknowledged packets
+                            del self.unacked_packets[ack_msg["seq"]]
+                            self.log(f"Received ACK for seq {ack_msg['seq']}")
+                            # Determine the new start of the window based on unacknowledged packets
+                            self.start_window = min(
+                                self.unacked_packets.keys()) if self.unacked_packets else self.sequence_number + 1
+
+                            # Adjust window size based on the congestion control phase
+                            if self.window_size >= self.thresh:
+                                # In congestion control phase, increase window size linearly
+                                self.window_size = self.window_size + 1
+                                self.mode = "Congestion control"
+                            else:
+                                # In slow start phase, double the window size
+                                self.window_size = 2 * self.window_size
+
+                            # Recalculate the end window based on the new window size
+                            self.end_window = self.start_window + self.window_size - 1
+                    else:
+                        self.log("Received corrupted ACK, ignoring.")
+                except Exception as e:
+                    self.log(f"Error processing ACK: {e}")
+
+            else:
+                break
+
+    def run(self):
+        """
+        Manages the sending of data packets based on stdin input, handling ACKs,
+        managing congestion control through dynamic window adjustments, and initiating
+        fast retransmissions or responding to timeouts as necessary.
+        """
+        eof = False  # End-of-file flag to indicate when all data has been read
+        while True:
+            # Send packets as long as we haven't reached the end of the window and not at EOF
+            while self.sequence_number < self.end_window and not eof:
+                data = sys.stdin.read(DATA_SIZE)
+                if data == "":  # If not data is left, mark EOF and exit the loop
+                    eof = True
+                    break
+                self.sequence_number += 1  # Increment sequence number for the new packet
+                msg = {"type": "msg", "data": data, "seq": self.sequence_number}
+                self.log(f"Sending packet seq {self.sequence_number}")
+                self.send_packet(msg, self.sequence_number)
+
+            self.receive_ack()
+            self.resend_packets()
+
+            # Exit condition: EOF reached and all packets acknowledged
+            if eof and len(self.unacked_packets) == 0:
+                self.log("All data sent and acknowledged. Exiting.")
+                break
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Send data using a sliding window protocol.')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()

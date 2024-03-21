@@ -1,0 +1,515 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import socket
+import json
+import select
+import copy
+
+
+class Router:
+    def __init__(self, asn, connections):
+        """
+        Initializes the BGP router with given ASN and connections.
+
+        :param asn: Autonomous System Number of this router.
+        :param connections: List of connections in the format 'port-neighborIP-relation'.
+        """
+        # Initialize router with ASN, forwarding table, socket connections, and relationships
+        self.asn = asn
+        self.forwarding_table = []  # Stores routes
+        self.messages = []
+        self.sockets = {}  # UDP sockets for communication with neighbors
+        self.ports = {}  # Ports used for communication
+        self.relations = {}  # Relationship type with each neighbor (cust, peer, prov)
+        print("Router at AS %s starting up" % asn)
+
+        # Set up connections based on the provided configuration
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+            # Create and configure socket for each neighbor
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))  # Bind to an available port
+            self.sockets[neighbor].setblocking(0)  # Make the socket non-blocking
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+
+            # Send initial handshake message to each neighbor
+            handshake_msg = {"type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}}
+            self.send(neighbor, json.dumps(handshake_msg))
+
+    @staticmethod
+    def our_addr(dst):
+        """
+        Generates the router's IP address based on the destination IP by modifying the last octet to '1'.
+
+        :param dst: Destination IP address.
+        :return: Modified source IP address for this router.
+        """
+        # Generate router's source IP based on the destination IP
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1  # Set last octet to 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, neighbor, message):
+        """
+        Sends a message to the specified neighbor.
+
+        :param neighbor: Neighbor's IP address to send the message to.
+        :param message: The message to send, in JSON format.
+        """
+        # Sends a JSON message to the specified neighbor
+        print(f"sent message: {message} to neighbor: {neighbor}")
+        self.sockets[neighbor].sendto(message.encode('utf-8'), ('localhost', self.ports[neighbor]))
+
+    def process_message(self, message, srcif):
+        """
+        Processes an incoming message, directing it to the appropriate handler based on its type.
+
+        :param message: The incoming message in JSON format.
+        :param srcif: The source interface or neighbor IP address from which the message was received. This is
+                  used to identify the neighbor and manage routing information accordingly.
+        """
+        # Process incoming messages and route them to the appropriate handler
+        msg = self.convert_json_dict(message)
+        if msg is None:
+            return  # If JSON decoding fails, skip the message
+
+        # Direct message to the appropriate method based on its type
+        msg_type = msg["type"]
+        if msg_type == "update":
+            self.handle_update_message(msg, msg["src"])
+        elif msg_type == "data":
+            self.handle_data_message(msg, srcif)
+        elif msg_type == "withdraw":
+            self.handle_withdraw_message(msg)
+        elif msg_type == "dump":
+            self.handle_dump_message(msg["src"])
+        else:
+            print(f"Unhandled message type: {msg_type}")
+
+    @staticmethod
+    def convert_json_dict(data):
+        """
+        Converts a JSON string into a dictionary.
+
+        :param data: JSON string.
+        :return: Dictionary object or None if JSON decoding fails.
+        """
+        # Convert JSON string to a Python dictionary, handling decoding errors
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON: {data}")
+            return None
+
+    @staticmethod
+    def convert_dict_json(dictionary):
+        """
+        Converts a dictionary into a JSON string.
+
+        :param dictionary: Dictionary to convert.
+        :return: JSON string representation of the dictionary.
+        """
+        # Convert a dictionary to a JSON string
+        return json.dumps(dictionary)
+
+    def handle_update_message(self, msg, srcif):
+        """
+        Handles an incoming route update message, updates the forwarding table, and forwards the message as needed.
+
+        :param msg: The route update message.
+        :param srcif: Source interface from which the message was received.
+        """
+        # Record the received message
+        self.messages.append(msg)
+
+        # Extract the AS path from the message
+        as_path = msg['msg']['ASPath']
+
+        # Check for own ASN in the AS path to prevent loops
+        if self.asn in as_path:
+            print(f"Ignoring route with own ASN in AS path: {as_path}")
+            return  # Do not process this update further
+
+        # Store the route in the forwarding table
+        msg_copy = copy.deepcopy(msg)  # Create a deep copy to avoid mutating the original message
+        self.forwarding_table.append({
+            'network': msg_copy['msg']['network'],
+            'netmask': msg_copy['msg']['netmask'],
+            'peer': srcif,
+            'localpref': msg_copy['msg']['localpref'],
+            'ASPath': msg_copy['msg']['ASPath'],
+            'selfOrigin': msg_copy['msg']['selfOrigin'],
+            'origin': msg_copy['msg']['origin']
+        })
+
+        # Aggregate routes in the forwarding table
+        self.aggregate_routes()
+
+        # Prepare message content for forwarding
+        forward_msg = copy.deepcopy(msg["msg"])
+        forward_msg["ASPath"].insert(0, self.asn)
+        forward_msg_content = {
+            'msg': {
+                'netmask': forward_msg['netmask'],
+                'ASPath': forward_msg['ASPath'],
+                'network': forward_msg['network']
+            },
+            'type': 'update'
+        }
+
+        # Forward the message based on the relationship with the source
+        if self.relations[msg['src']] == "cust":
+            # Forward to all neighbors except the source if it came from a customer
+            for neighbor in self.relations:
+                if neighbor != msg['src']:
+                    forward_msg_content['src'] = self.our_addr(neighbor)
+                    forward_msg_content['dst'] = neighbor
+                    self.send(neighbor, json.dumps(forward_msg_content))
+        else:
+            # Forward only to customers if it came from a peer or provider
+            for customer in filter(lambda n: self.relations[n] == "cust" and n != msg['src'], self.relations):
+                forward_msg_content['src'] = self.our_addr(customer)
+                forward_msg_content['dst'] = customer
+                self.send(customer, json.dumps(forward_msg_content))
+
+    def handle_data_message(self, msg, srcif):
+        """
+        Handles forwarding of data messages based on the best available path.
+
+
+        :param msg: The data message to be forwarded.
+        :param srcif: Source interface from which the message was received.
+        """
+        # Extract destination and source from the message
+        dst = msg["dst"]
+        src = msg["src"]
+
+        # Attempt to find the best path to the destination
+        best_path = self.select_best_path(dst)
+
+        # Check if best path was found
+        if best_path is not None:
+            dst_router = best_path["peer"]
+            if self.relations[srcif] == "cust" or self.relations[dst_router] == "cust":
+                # If a profitable path exists, forward the message
+                self.send(best_path["peer"], self.convert_dict_json(msg))
+            else:
+                self.send_no_route_message(src, srcif)
+                print(f"Data from {src} to {dst} dropped: not profitable to forward.")
+        else:
+            # No route found, send a no route message
+            self.send_no_route_message(src, srcif)
+            print(f"No route found for destination {dst}, dropping message.")
+
+    def select_best_path(self, destination):
+        """
+        Selects the best path for a given destination IP address from the forwarding table.
+
+        :param destination: Destination IP address.
+        :return: The best path for the destination or None if no path is found.
+        """
+        # Filter routes that match the destination IP address
+        relevant_paths = [route for route in self.forwarding_table if
+                          self.ip_matches_network(destination, route["network"], route["netmask"])]
+
+        # No matching routes found
+        if not relevant_paths:
+            return None
+
+        # Exactly one matching route found
+        if len(relevant_paths) == 1:
+            return relevant_paths[0]
+
+        # Multiple matching routes found, determine the best one
+        if len(relevant_paths) > 1:
+            # First, try to select based on BGP attributes if routes are exactly the same
+            if self.check_duplicate_paths(relevant_paths):
+                origin_preference = {'IGP': 1, 'EGP': 2, 'INCOMPLETE': 3}
+
+                # Prefer routes based on local preference, AS path length, and origin type
+                best_path = sorted(relevant_paths, key=lambda x: (-x["localpref"],
+                                                                  not x["selfOrigin"],
+                                                                  len(x["ASPath"]),
+                                                                  origin_preference.get(x["origin"], 4),
+                                                                  x["peer"]))[0]
+                return best_path
+            # Handle overlapping routes by selecting the one with the longest prefix (highest netmask)
+            else:
+                best_path = relevant_paths[0]
+                best_path_netmask = self.netmask_to_bits(best_path["netmask"])
+
+                for path in relevant_paths[1:]:
+                    new_path_netmask_bin = self.netmask_to_bits(path["netmask"])
+                    if new_path_netmask_bin > best_path_netmask:
+                        best_path_netmask = new_path_netmask_bin
+                        best_path = path
+                return best_path
+
+    def ip_matches_network(self, ip, network, netmask):
+        """
+        Checks if an IP address belongs to a specified network.
+
+        :param ip: The IP address to check.
+        :param network: The network IP.
+        :param netmask: The netmask for the network.
+        :return: True if the IP belongs to the network, False otherwise.
+        """
+        # Convert IP addresses and netmask to binary for comparison
+        ip_bin = self.ip_to_bin(ip)
+        network_bin = self.ip_to_bin(network)
+        netmask_bin = self.ip_to_bin(netmask)
+
+        # Check if the IP address belongs to the specified network
+        ip_net = ip_bin & netmask_bin
+        network_net = network_bin & netmask_bin
+        return ip_net == network_net  # True if matches, False otherwise
+
+    @staticmethod
+    def ip_to_bin(ip):
+        """
+        Converts an IP address from dotted decimal format to its binary representation.
+
+        :param ip: The IP address in dotted decimal format.
+        :return: The binary representation of the IP address.
+        """
+        # Split the IP address into octets and convert each to binary
+        octets = map(int, ip.split('.'))
+        return sum([octet << (8 * (3 - index)) for index, octet in enumerate(octets)])
+
+    def handle_dump_message(self, srcif):
+        """
+        Responds to a dump request by sending the current routing table to the requester.
+
+        :param srcif: The interface (source IP address) from which the dump request was received.
+        """
+        # Prepare the routing table as the response message payload
+        table_response = []
+        for route in self.forwarding_table:
+            table_response.append(route)
+
+        # Construct the response message with the routing table data
+        response_msg = {
+            "type": "table",
+            "src": self.our_addr(srcif),  # Source address of the response
+            "dst": srcif,  # Destination address set to the source of the request
+            "msg": table_response  # The routing table data
+        }
+
+        # Send the constructed table response back to the request source
+        self.send(srcif, self.convert_dict_json(response_msg))
+
+    def handle_withdraw_message(self, message):
+        """
+        Processes an incoming withdrawal message by removing the specified routes from the forwarding table
+        and propagates the withdrawal to other neighbors as needed.
+
+        :param message: The withdrawal message containing routes to remove.
+        """
+        # Record the incoming withdrawal message for potential future use
+        self.messages.append(message)
+
+        # Remove the specified routes from the forwarding table
+        withdrawal_routes = message["msg"]  # Extract withdrawal routes from the message
+        self.forwarding_table = [route for route in self.forwarding_table if not
+        (route["peer"] == message["src"] and route["network"] in
+         [withdrawn["network"] for withdrawn in withdrawal_routes])]
+
+        # Rebuild and aggregate the routing table after withdrawal
+        self.rebuild_and_aggregate_routes()
+
+        # Propagate the withdrawal to all neighbors except the source of the withdrawal
+        for neighbor in self.relations:
+            if message['src'] != neighbor:
+                withdrawal_message_content = {
+                    'msg': withdrawal_routes,
+                    'src': self.our_addr(neighbor),
+                    'dst': neighbor,
+                    'type': 'withdraw'
+                }
+                self.send(neighbor, json.dumps(withdrawal_message_content))
+
+    def send_no_route_message(self, src, srcif):
+        """
+        Sends a 'no route' message back to the source indicating that no route could be found for the destination.
+
+
+        :param src: The original source IP address of the data message.
+        :param srcif: The source interface IP address from which the data message was received.
+        """
+        # Construct the 'no route' message
+        no_route_message = {
+            "src": self.our_addr(srcif),  # Set the message source to this router's IP address for srcif
+            "dst": src,   # Set the destination to the original source of the data message
+            "type": "no route",
+            "msg": {}
+        }
+
+        # Send the 'no route' message back to the source
+        self.send(srcif, self.convert_dict_json(no_route_message))
+
+    @staticmethod
+    def check_duplicate_paths(relevant_paths):
+        """
+        Checks for duplicate route entries in the forwarding table based on network and netmask.
+
+
+        :param relevant_paths: A list of route dictionaries to be checked for duplicates.
+        :return: True if there are duplicate paths (same network and netmask), False otherwise.
+        """
+        # Extract network and netmask of the first route in the list for comparison
+        network_match = relevant_paths[0]["network"]
+        netmask_match = relevant_paths[0]["netmask"]
+
+        # Loop through the rest of the routes to check for any that match the first route's network and netmask
+        for path in relevant_paths[1:]:
+            if path["network"] == network_match and path["netmask"] == netmask_match:
+                # If a duplicate is found, return True
+                return True
+
+        # If no duplicates are found, return False
+        return False
+
+    @staticmethod
+    def netmask_to_bits(netmask):
+        """
+        Converts a netmask from dotted decimal notation to a count of the number of bits set to 1.
+
+
+        :param netmask: A string representing the netmask in dotted decimal notation
+        :return: An integer representing the number of bits set to 1 in the netmask.
+        """
+        # Split the netmask into its constituent octets
+        octets = netmask.split('.')
+
+        # Initialize a counter for bits set to 1
+        count_ones = 0
+
+        # Convert each octet from decimal to binary and count the number of bits set to 1
+        for octet in octets:
+            octet_bin = bin(int(octet))
+            count_ones += octet_bin.count('1')
+
+        # Return the total count of bits set to 1
+        return count_ones
+
+    def aggregate_routes(self):
+        """
+        Aggregates routes in the forwarding table to simplify it.
+        Routes can be aggregated based on common properties and adjacent network addresses.
+        """
+        # Iterate over each route in the forwarding table
+        for current_route in self.forwarding_table:
+            # Split the current route's network address into its constituent octets for comparison
+            current_ip_parts = current_route['network'].split(".")
+
+            # Check potential routes for aggregation against the current route
+            for potential_aggregate_route in self.forwarding_table:
+                # Split the potential route's network address into octets
+                potential_ip_parts = potential_aggregate_route['network'].split(".")
+
+                # Check if routes have the same BGP attributes and are adjacent
+                if (current_route['peer'] == potential_aggregate_route['peer'] and
+                        current_route['localpref'] == potential_aggregate_route['localpref'] and
+                        current_route['ASPath'] == potential_aggregate_route['ASPath'] and
+                        current_route['selfOrigin'] == potential_aggregate_route['selfOrigin'] and
+                        current_route['origin'] == potential_aggregate_route['origin'] and
+                        current_ip_parts[0] == potential_ip_parts[0] and
+                        current_ip_parts[1] == potential_ip_parts[1] and
+                        current_ip_parts[3] == "0" and potential_ip_parts[3] == "0" and
+                        (int(potential_ip_parts[2]) + (
+                                255 - int(potential_aggregate_route['netmask'].split(".")[2]) + 1)) == int(
+                            current_ip_parts[2])):
+
+                    # Remove the current route as it will be aggregated into the potential aggregate route
+                    self.forwarding_table.remove(current_route)
+
+                    # Update the netmask of the potential aggregate route to reflect the aggregation
+                    netmask_parts = potential_aggregate_route['netmask'].split(".")
+                    if netmask_parts[3] == "0":
+                        if netmask_parts[2] == "0":
+                            if netmask_parts[1] == "0":
+                                if netmask_parts[0] == "0":
+                                    # If all octets are 0 (which should never happen in a valid subnet mask), set to 0.0.0.0
+                                    potential_aggregate_route['netmask'] = "0.0.0.0"
+                                else:
+                                    # Decrease the first octet by 1 to broaden the subnet mask accordingly.
+                                    potential_aggregate_route['netmask'] = f"{int(netmask_parts[0]) - 1}.0.0.0"
+                            else:
+                                # Decrease the second octet by 1 and reset the octets to its right
+                                potential_aggregate_route[
+                                    'netmask'] = f"{netmask_parts[0]}.{int(netmask_parts[1]) - 1}.0.0"
+                        else:
+                            # Decrease the third octet by 1 and reset the last octet
+                            potential_aggregate_route[
+                                'netmask'] = f"{netmask_parts[0]}.{netmask_parts[1]}.{int(netmask_parts[2]) - 1}.0"
+                    else:
+                        # Decrease the last octet by 1 to aggregate the network range
+                        potential_aggregate_route[
+                            'netmask'] = f"{netmask_parts[0]}.{netmask_parts[1]}.{netmask_parts[2]}.{int(netmask_parts[3]) - 1}"
+
+    def rebuild_and_aggregate_routes(self):
+        """
+        Rebuilds the routing table based on received messages and then aggregates the routes.
+        This method processes both 'update' and 'withdraw' messages to maintain an up-to-date routing table.
+        """
+        new_routing_table = []
+
+        # Process each message to rebuild the routing table
+        for message in self.messages:
+            if message['type'] == "update":
+                # Add or update the route based on the 'update' message
+                new_route = {
+                    'network': message['msg']['network'],
+                    'netmask': message['msg']['netmask'],
+                    'peer': message['src'],
+                    'localpref': message['msg']['localpref'],
+                    'ASPath': message['msg']['ASPath'],
+                    'selfOrigin': message['msg']['selfOrigin'],
+                    'origin': message['msg']['origin']
+                }
+                new_routing_table.append(new_route)
+
+            elif message['type'] == "withdraw":
+                # Remove the specified routes based on the 'withdraw' message
+                new_routing_table = [route for route in new_routing_table
+                                     if not (route['peer'] == message['src'] and
+                                             any(route['network'] == withdraw_msg['network'] for withdraw_msg in
+                                                 message['msg']))]
+
+        # Update the main routing table with the rebuilt one
+        self.forwarding_table = new_routing_table
+
+        # After rebuilding, attempt to aggregate routes to simplify the table
+        self.aggregate_routes()
+
+
+    def run(self):
+        """
+        Main loop of the router. Listens for messages on all interfaces and processes them as they arrive.
+        """
+        # Continuously listen for messages on all sockets
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                # Identify which socket received the message
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+                # Log receipt and process the message
+                print("Received message '%s' from %s" % (msg, srcif))
+                self.process_message(msg, srcif)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+
+    router = Router(args.asn, args.connections)
+    router.run()

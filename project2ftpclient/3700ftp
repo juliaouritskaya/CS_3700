@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+
+import argparse
+from ftp_client import FTPClient
+
+# Create an ArgumentParser object for handling command-line arguments
+parser = argparse.ArgumentParser()
+
+# Add a positional argument for specifying the operation to be performed by the FTP client.
+parser.add_argument(
+    "operation",
+    choices=['ls', 'rm', 'rmdir', 'mkdir', 'cp', 'mv'],
+    help="The operation to execute. Valid operations are 'ls', 'rm', 'rmdir', 'mkdir', 'cp', and 'mv'"
+)
+
+# Add a positional argument for any additional parameters required by the operation.
+# Allows 0 or more params, defaults to ['.'] if none are provided.
+parser.add_argument(
+    'params',
+    nargs='*',
+    default=["."],
+    help="Parameters for the given operation. Will be one or two paths and/or URLs."
+)
+
+# Parse the arguments provided to the script.
+args = parser.parse_args()
+
+# Initialize the FTPClient with the operation and parameters obtained from the command line.
+ftp_client = FTPClient(args.operation, args.params)
+
+print()
+

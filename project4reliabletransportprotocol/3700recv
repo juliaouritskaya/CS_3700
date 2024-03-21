@@ -1,0 +1,121 @@
+#!/usr/bin/env -S python3 -u
+
+import socket, json, sys, hashlib, base64
+
+
+def calculate_checksum(data):
+    """
+    Calculates the SHA-256 hash of given data, encoded in Base64.
+
+    :param data: The data for which the checksum is calculated.
+    :return: The calculated checksum, encoded in Base64.
+    """
+    # Initialize a new SHA-256 hash object
+    sha256 = hashlib.sha256()
+    # Update the hash object with the data
+    sha256.update(data)
+    # Return the hash, encoded in Base64
+    return base64.b64encode(sha256.digest()).decode('utf-8')
+
+
+def verify_checksum(data, received_checksum):
+    """
+    Verify the integrity of received data against a provided checksum.
+
+    :param data: The received data to verify.
+    :param received_checksum: The checksum received alongside the data for verification.
+    :return: True if the calculated checksum matches the received checksum, False otherwise.
+    """
+    # Calculate checksum for the given data
+    calculated_checksum = calculate_checksum(data)
+    # Compare the calculated checksum with the received one
+    return calculated_checksum == received_checksum
+
+
+class Receiver:
+    def __init__(self):
+        """
+        Initializes the Receiver instance.
+        """
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log(f"Bound to port {self.port}")
+
+        self.remote_host = None
+        self.remote_port = None
+        self.received_seqs = set()  # Set to rack received sequence numbers and detect duplicates
+
+    def send(self, message):
+        """
+        Sends a message to the remote host.
+
+        :param message: The message to be sent, which will be converted to JSON format.
+        """
+        # Convert the message to JSON and encode it to bytes for transmission
+        message_json = json.dumps(message).encode('utf-8')
+        # Calculate checksum for the message to ensure integrity
+        checksum = calculate_checksum(message_json)
+        # Package the data and checksum into a new packet
+        packet = json.dumps({'data': message, 'checksum': checksum}).encode('utf-8')
+        self.socket.sendto(packet, (self.remote_host, self.remote_port))
+
+    @staticmethod
+    def log(message):
+        """
+        Logs a message to standard error.
+
+        :param message: The message to be logged.
+        """
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def run(self):
+        """
+        Main loop that listens for incoming packets, verifies their integrity,
+        sends ACKs, and handles packet ordering.
+        """
+        next_expected_seq = 1  # Expected sequence number of the next packet
+        buffer = {}  # Buffer for out-of-order packets
+
+        while True:
+            data, addr = self.socket.recvfrom(65535)
+            try:
+                packet = json.loads(data.decode('utf-8'))  # Decode packet from JSON
+
+                # Verify packet checksum
+                packet_data_json = json.dumps(packet['data']).encode('utf-8')
+                if not verify_checksum(packet_data_json, packet['checksum']):
+                    self.log("Received corrupted packet, ignoring.")
+                    continue  # Skip further processing for corrupted packets
+
+                msg = packet['data']  # Extract the message from the packet
+                seq = msg["seq"]  # Extract sequence number
+
+                # Set remote host and port if not already set
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+
+                self.send({"type": "ack", "seq": seq})  # Send ACK for the received packet
+
+                # Process packets in sequence order
+                if seq == next_expected_seq:
+                    print(msg["data"], end='', flush=True)  # Print data for in-order packets
+                    next_expected_seq += 1  # Increment expected sequence number
+
+                    # Process any buffered packets that are now in order
+                    while next_expected_seq in buffer:
+                        print(buffer[next_expected_seq], end='', flush=True)
+                        del buffer[next_expected_seq]  # Remove from buffer
+                        next_expected_seq += 1
+                elif seq > next_expected_seq:
+                    buffer[seq] = msg["data"]  # Buffer out-of-order packets
+            except json.JSONDecodeError as e:
+                self.log(f"Error decoding JSON: {e} - Data: {data[:50]}")
+                continue  # Continue listening for packets even after a decode error
+
+
+if __name__ == "__main__":
+    receiver = Receiver()
+    receiver.run()
